@@ -1,4 +1,4 @@
-use crate::egui::Color32;
+use egui::Color32;
 use egui::{epaint, style};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub struct Colors {
     pub crust: Color32,
 }
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub const LATTE: Colors = Colors {
     rosewater: Color32::from_rgb(220, 138, 120),
     flamingo: Color32::from_rgb(221, 120, 120),
@@ -61,7 +61,7 @@ pub const LATTE: Colors = Colors {
     crust: Color32::from_rgb(220, 224, 232),
 };
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub const FRAPPE: Colors = Colors {
     rosewater: Color32::from_rgb(242, 213, 207),
     flamingo: Color32::from_rgb(238, 190, 190),
@@ -91,7 +91,7 @@ pub const FRAPPE: Colors = Colors {
     crust: Color32::from_rgb(35, 38, 52),
 };
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub const MACCHIATO: Colors = Colors {
     rosewater: Color32::from_rgb(244, 219, 214),
     flamingo: Color32::from_rgb(240, 198, 198),
@@ -121,7 +121,7 @@ pub const MACCHIATO: Colors = Colors {
     crust: Color32::from_rgb(24, 25, 38),
 };
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub const MOCHA: Colors = Colors {
     rosewater: Color32::from_rgb(245, 224, 220),
     flamingo: Color32::from_rgb(242, 205, 205),
@@ -151,13 +151,13 @@ pub const MOCHA: Colors = Colors {
     crust: Color32::from_rgb(17, 17, 27),
 };
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub fn set_theme(ctx: &egui::Context, theme: Colors) {
     let old = ctx.style().visuals.clone();
     ctx.set_visuals(theme.visuals(old));
 }
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub fn set_style_theme(style: &mut egui::Style, theme: Colors) {
     let old = style.visuals.clone();
     style.visuals = theme.visuals(old);

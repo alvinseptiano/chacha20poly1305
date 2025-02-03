@@ -1,387 +1,446 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(rustdoc::missing_crate_level_docs)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 mod crypto;
+mod data;
 mod themes;
 
-use std::thread;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
-use egui::{Spinner, Ui};
-use eframe::egui::{self, Style, Visuals, ViewportCommand};
-use human_duration::human_duration;
 use crate::crypto::Crypto;
+use crate::data::{EncryptAlgorithm, EncryptType};
+
+use egui::{CentralPanel, Frame, Spinner, TopBottomPanel, Ui};
+use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex, TabViewer};
+use egui_extras::{Column, TableBuilder};
+use hex::encode as hex_encode;
+use human_duration::human_duration;
+use mime_guess::MimeGuess;
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result {
     env_logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
+            .with_maximized(true)
+            .with_decorations(true)
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([400.0, 100.0])
-            .with_drag_and_drop(true)
-            .with_transparent(true),
-
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
     eframe::run_native(
-        "ChaCha20-Poly1305",
+        "Encrypt It",
         options,
-        Box::new(|creation_context| {
-            let style = Style {
-                visuals: Visuals::light(),
-                ..Style::default()
-            };
-            creation_context.egui_ctx.set_style(style);
-            Ok(Box::new(MyApp::new()))
-        }),
+        Box::new(|_cc| Ok(Box::<MyApp>::default())),
     )
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum EncryptType {
-    Encryption,
-    Decryption
-}
-
-impl Default for EncryptType {
-    fn default() -> Self {
-        EncryptType::Encryption
-    }
-}
-
-#[derive(Default)]
 struct MyApp {
-    dropped_files: Vec<egui::DroppedFile>,
-    password: String,
-    selected_option: EncryptType,
-    file_path: String,
-    output_message: Arc<Mutex<String>>,
-    is_processing: bool,
-    tx: Option<Sender<String>>, // Add sender
-    rx: Option<Receiver<String>>, // Add receiver
+    context: data::MyContext,
+    tree: DockState<String>,
 }
 
-impl eframe::App for MyApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array() // Make sure we don't paint anything behind the rounded corners
+impl TabViewer for data::MyContext {
+    type Tab = String;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab.as_str().into()
     }
-    
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        custom_window_frame(ctx, "ChaCha20-Poly1305", |ui| {
-            ctx.set_pixels_per_point(2.0);
-            ui.group(|ui| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("File: ");
-                    if ui.button("Buka File atau Drag kesini").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.file_path = path.display().to_string();    
+
+    fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
+        match tab.as_str() {
+            "ChaCha20-Poly1305" => {
+                self.selected_algorithm = EncryptAlgorithm::Chacha20Poly1305;
+                self.chacha20poly1305(ui);
+            }
+            "Des" => {
+                self.selected_algorithm = EncryptAlgorithm::Des;
+                self.des(ui);
+            }
+            "Info" => {
+                self.create_table(ui);
+            }
+            "Output" => {
+                self.show_output(ui);
+            }
+            _ => {
+                ui.label(tab.as_str());
+            }
+        }
+    }
+
+    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+        ["ChaCha20-Poly1305", "Des"].contains(&tab.as_str())
+    }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> bool {
+        self.open_tabs.remove(tab);
+        true
+    }
+}
+
+impl data::MyContext {
+    fn process_file(&mut self) {
+        self.is_processing = true;
+        let file_path = self.file_path.clone().unwrap();
+        let key = self.key.clone();
+        let nonce = self.nonce.clone();
+        let selected_algorithm = self.selected_algorithm;
+        let tx = self.tx.clone().unwrap();
+        let is_encrypt = match self.operation_type {
+            EncryptType::Encryption => true,
+            EncryptType::Decryption => false,
+        };
+        let message = if is_encrypt { "Enkripsi" } else { "Dekripsi" };
+
+        let mut vec_key = key.as_bytes().to_vec();
+        let mut nonce = nonce.as_bytes().to_vec();
+        nonce.resize(24, 0);
+        vec_key.resize(32, 0);
+
+        let key_array: [u8; 32] = vec_key
+            .try_into()
+            .expect("The string could not be converted into a [u8; 32] array");
+        let nonce_array: [u8; 24] = nonce
+            .try_into()
+            .expect("The string could not be converted into a [u8; 24] array");
+
+        thread::spawn(move || {
+            let start = Instant::now();
+            let duration: Duration;
+            let result_message = match selected_algorithm {
+                EncryptAlgorithm::Chacha20Poly1305 => {
+                    match Crypto::chaca20poly1305(&file_path, &key_array, &nonce_array, is_encrypt)
+                    {
+                        Ok(ciphertext) => {
+                            let hex_ciphertext = hex_encode(ciphertext);
+                            duration = start.elapsed();
+                            vec![
+                                format!("{}", hex_ciphertext),
+                                format!(
+                                    "{} berhasil ✅ dalam waktu ⏱ {}",
+                                    message,
+                                    human_duration(&duration)
+                                ),
+                            ]
                         }
+                        Err(_e) => vec!["Dekripsi ❌ gagal!".to_string()],
                     }
-                    if !self.dropped_files.is_empty() {
-                        ui.group(|ui| {
-                            ui.label("Dropped files:");
-        
-                            for file in &self.dropped_files {
-                                let mut info = if let Some(path) = &file.path {
-                                    path.display().to_string()
-                                } else if !file.name.is_empty() {
-                                    file.name.clone()
-                                } else {
-                                    "???".to_owned()
-                                };
-        
-                                let mut additional_info = vec![];
-                                if !file.mime.is_empty() {
-                                    additional_info.push(format!("type: {}", file.mime));
-                                }
-                                if let Some(bytes) = &file.bytes {
-                                    additional_info.push(format!("{} bytes", bytes.len()));
-                                }
-                                if !additional_info.is_empty() {
-                                    info += &format!(" ({})", additional_info.join(", "));
-                                }
-                                self.file_path = info.clone();
-                                ui.label(info);
-                            }
-                        });
-                    }
-                });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("Jenis operasi: ");
-                    ui.radio_value(
-                        &mut self.selected_option, EncryptType::Encryption,"Enkripsi");
-                    ui.radio_value(
-                        &mut self.selected_option, EncryptType::Decryption, "Dekripsi");
-                });
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let name_label = ui.label("Kata sandi: ");
-                    ui.text_edit_singleline(&mut self.password)
-                    .labelled_by(name_label.id);
-                });
-                ui.add_space(10.0);
-
-                if ui.button("Proses File").clicked() {
-                    self.update_output_message("Proses sedang berlangsung..");
-                    ui.add(egui::Spinner::new()); 
-                    self.encrypt();
-                    ctx.request_repaint();
                 }
-            }); // Group end
-                
-            ui.separator();
-            self.show_label(ui);
-        });
-        preview_files_being_dropped(ctx);
-        ctx.input(|i| { // Collect dropped files:
-            if !i.raw.dropped_files.is_empty() {
-                self.dropped_files.clone_from(&i.raw.dropped_files);
-            }
-        });
-
-        if let Some(rx) = &self.rx {
-            if let Ok(message) = rx.try_recv() {
-                self.update_output_message(&message);
-                self.is_processing = false;
-            }
-        }
-
-        if self.is_processing {
-            ctx.request_repaint(); // Request repaint to update the UI
-        }
+                EncryptAlgorithm::Des => match Crypto::des(&file_path, &key_array, is_encrypt) {
+                    Ok(ciphertext) => {
+                        let hex_ciphertext = hex::encode(ciphertext);
+                        duration = start.elapsed();
+                        vec![
+                            format!("{}", hex_ciphertext),
+                            format!(
+                                "{} berhasil ✅ dalam waktu ⏱️: {}",
+                                message,
+                                human_duration(&duration)
+                            ),
+                        ]
+                    }
+                    Err(_e) => vec!["Dekripsi ❌ gagal!".to_string()],
+                },
+            };
+            tx.send(result_message).unwrap();
+        }); // End of thread
     }
-    
-}
 
-impl MyApp {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self {
-            tx: Some(tx),
-            rx: Some(rx),
-            ..Default::default()
-        }
-    }
-    fn show_label(&self, ui: &mut Ui) {
-        let output_message = self.output_message.lock().unwrap();
-        if self.is_processing {
-            ui.horizontal(|ui| {
-                ui.label("Proses sedang berlangsung..");
-                ui.add(Spinner::new()); 
+    fn passphrase_input(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            Frame::none().show(ui, |ui| {
+                ui.set_min_width(80.0);
+                ui.label("Kata Kunci: ");
             });
-        } else {
-            ui.label(format!("Output: {}", &*output_message));
+            ui.text_edit_singleline(&mut self.key)
+        });
+        ui.add_space(10.0);
+        let file_selected = self.file_path.is_some();
+        if self.selected_algorithm == EncryptAlgorithm::Chacha20Poly1305 {
+            ui.horizontal(|ui| {
+                Frame::none().show(ui, |ui| {
+                    ui.set_min_width(80.0);
+                    ui.label("Nonce: ");
+                });
+                ui.text_edit_singleline(&mut self.nonce);
+            });
         }
+        ui.add_space(10.0);
+        let process_button = ui.add_enabled(file_selected, egui::Button::new("Proses File"));
+        if process_button.clicked() {
+            self.update_output_message("Proses Sedang Berlangsung..");
+            self.process_file();
+        }
+        ui.add_space(10.0);
     }
+
+    fn chacha20poly1305(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        self.select_file(ui);
+        self.select_operation_type(ui);
+        self.passphrase_input(ui);
+    }
+
+    fn des(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        self.select_file(ui);
+        self.select_operation_type(ui);
+        self.passphrase_input(ui);
+    }
+
+    fn select_operation_type(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Jenis operasi: ");
+            ui.radio_value(
+                &mut self.operation_type,
+                EncryptType::Encryption,
+                "Enkripsi",
+            );
+            ui.radio_value(
+                &mut self.operation_type,
+                EncryptType::Decryption,
+                "Dekripsi",
+            );
+        });
+    }
+
+    fn select_file(&mut self, ui: &mut Ui) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            Frame::none().show(ui, |ui| {
+                ui.set_min_width(80.0);
+                ui.label("File: ");
+            });
+            if ui.button("Buka File").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    let path_str = path.display().to_string();
+                    self.file_path = Some(path_str.clone());
+                    let _ = self.set_metadata(path_str.clone());
+                }
+            }
+        });
+    }
+
     fn update_output_message(&self, new_text: &str) {
         let mut output_message = self.output_message.lock().unwrap();
         *output_message = new_text.to_string();
     }
-    fn encrypt(&mut self) {
-        // println!("encrypt");
-        self.is_processing = true;
-        let file_path = self.file_path.clone();
-        let password = self.password.clone();
-        let selected_option = self.selected_option;
-        let tx = self.tx.clone().unwrap();
 
-        thread::spawn(move || {
-            let mut key = password.as_bytes().to_vec();
-            key.resize(32, 0);
-            let mut nonce = password.as_bytes().to_vec();
-            nonce.resize(24, 0);
-        
-            let key_array: [u8; 32] = key.try_into().expect("The string could not be converted into a [u8; 32] array");
-            let nonce_array: [u8; 24] = nonce.try_into().expect("The string could not be converted into a [u8; 24] array");
+    fn update_cipher_text(&self, new_text: &str) {
+        let edited = new_text
+            .chars() // Convert to an iterator of characters
+            .collect::<Vec<_>>() // Collect characters into a Vec<char>
+            .chunks(2) // Chunk the characters into pairs
+            .map(|chunk| chunk.iter().collect::<String>()) // Convert each chunk to a String
+            .collect::<Vec<String>>() // Collect all chunks into a Vec<String>
+            .join(" "); // Join them back into a single string with a separator
 
-            let start = Instant::now();
-            let duration: Duration;
-            println!("{}", file_path);
-            let result_message = match selected_option {
-                EncryptType::Encryption => 
-                match Crypto::encrypt(&file_path, &key_array, &nonce_array) {
-                    Ok(_) => {
-                        duration = start.elapsed();
-                        format!("Enkripsi berhasil dalam waktu {}", human_duration(&duration))
-                    },
-                    Err(_e) => "Enkripsi gagal!".to_string(),
-                },
-                EncryptType::Decryption => 
-                match Crypto::decrypt(&file_path, &key_array, &nonce_array) {
-                    Ok(_) => {
-                        duration = start.elapsed();
-                        format!("Dekripsi berhasil dalam waktu {}", human_duration(&duration))
-                    },
-                    Err(_e) => "Dekripsi gagal!".to_string(),
-                },
-            };
-            println!("{}", result_message);
-            tx.send(result_message).unwrap();
-        });
+        let mut output_message = self.ciphertext.lock().unwrap();
+        *output_message = edited.to_string();
+    }
+
+    fn show_output(&mut self, ui: &mut Ui) {
+        ui.label(self.file_metada.clone());
+        let output_message = self.output_message.lock().unwrap();
+
+        if self.is_processing {
+            ui.horizontal(|ui| {
+                ui.label("Proses sedang berlangsung..");
+                ui.add(Spinner::new());
+            });
+        } else {
+            ui.label(&*output_message);
+        }
+    }
+
+    fn create_table(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Hex:\n");
+        let ciphertext = self.ciphertext.lock().unwrap();
+        let rows: Vec<&str> = ciphertext.split_whitespace().collect();
+        let column_names = [
+            "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0A", "0B", "0C", "0D", "0E", "0F",
+        ];
+        let columns = column_names.len();
+        let mut table = TableBuilder::new(ui);
+
+        for _ in 0..columns {
+            table = table.column(Column::auto().resizable(true).at_least(20.0));
+        }
+
+        table
+            .header(20.0, |mut header| {
+                for &name in &column_names {
+                    header.col(|ui| {
+                        ui.label(name);
+                    });
+                }
+            })
+            .body(|mut body| {
+                for row_chunk in rows.chunks(columns) {
+                    body.row(30.0, |mut row| {
+                        for cell in row_chunk {
+                            row.col(|ui| {
+                                ui.label(cell.to_string());
+                            });
+                        }
+                    });
+                }
+            });
+    }
+
+    fn set_metadata(&mut self, path: String) -> std::io::Result<()> {
+        let metadata = fs::metadata(path.clone())?; // Get metadata for the file
+        let file_size = metadata.len(); // Get the file size
+
+        let mut last_edited = String::new();
+        if let Ok(modified) = metadata.modified() {
+            let duration = modified.duration_since(UNIX_EPOCH).unwrap();
+            let datetime = UNIX_EPOCH + duration;
+            let datetime = chrono::DateTime::<chrono::Local>::from(datetime);
+            last_edited = datetime.to_string();
+        }
+
+        // Set filetype
+        let mime_path = Path::new(path.as_str());
+        let mut file_type = "application/octet-stream".to_string(); // Default MIME type
+
+        // Extract the file extension
+        if let Some(extension) = mime_path.extension() {
+            // Convert the extension to a string
+            let ext_str = extension.to_string_lossy();
+            // Get MIME type from the file extension
+            let mime = MimeGuess::from_ext(&ext_str).first_or_octet_stream();
+            file_type = mime.clone().to_string();
+        }
+        self.file_metada = format!(
+            "Lokasi: {}\nTipe: {}\nUkuran file: {} bytes\nTanggal: {}",
+            path, file_type, file_size, last_edited
+        );
+        Ok(())
     }
 }
 
-fn preview_files_being_dropped(ctx: &egui::Context) {
-    use egui::*;
-    use std::fmt::Write as _;
-
-    if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
-        let text = ctx.input(|i| {
-            let mut text = "Dropping files:\n".to_owned();
-            for file in &i.raw.hovered_files {
-                if let Some(path) = &file.path {
-                    write!(text, "\n{}", path.display()).ok();
-                } else if !file.mime.is_empty() {
-                    write!(text, "\n{}", file.mime).ok();
-                } else {
-                    text += "\n???";
+impl Default for MyApp {
+    fn default() -> Self {
+        let mut dock_state =
+            DockState::new(vec!["ChaCha20-Poly1305".to_string(), "Des".to_string()]);
+        let [_, _] = dock_state.main_surface_mut().split_right(
+            NodeIndex::root(),
+            0.5,
+            vec!["Info".to_owned()],
+        );
+        let [_, _] = dock_state.main_surface_mut().split_below(
+            NodeIndex::root(),
+            0.5,
+            vec!["Output".to_owned()],
+        );
+        let (tx, rx) = mpsc::channel();
+        let mut open_tabs = HashSet::new();
+        let expanded_tab = Some(String::default());
+        for node in dock_state[SurfaceIndex::main()].iter() {
+            if let Some(tabs) = node.tabs() {
+                for tab in tabs {
+                    open_tabs.insert(tab.clone());
                 }
             }
-            text
-        });
-
-        let painter =
-            ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
-
-        let screen_rect = ctx.screen_rect();
-        painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
-        painter.text(
-            screen_rect.center(),
-            Align2::CENTER_CENTER,
-            text,
-            TextStyle::Heading.resolve(&ctx.style()),
-            Color32::WHITE,
-        );
-    }
-}
-
-fn custom_window_frame(ctx: &egui::Context, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    use egui::*;
-    
-    let panel_frame = egui::Frame {
-        fill: ctx.style().visuals.window_fill(),
-        rounding: 10.0.into(),
-        stroke: ctx.style().visuals.widgets.noninteractive.fg_stroke,
-        outer_margin: 0.5.into(), // so the stroke is within the bounds
-        ..Default::default()
-    };
-
-    CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-        let app_rect = ui.max_rect();
-
-        let title_bar_height = 32.0;
-        let title_bar_rect = {
-            let mut rect = app_rect;
-            rect.max.y = rect.min.y + title_bar_height;
-            rect
+        }
+        let context = data::MyContext {
+            key: String::default(),
+            nonce: String::default(),
+            file_path: None,
+            output_message: Arc::new(Mutex::new(String::new())),
+            ciphertext: Arc::new(Mutex::new(String::new())),
+            is_processing: false,
+            tx: Some(tx),
+            rx: Some(rx),
+            selected_algorithm: EncryptAlgorithm::Chacha20Poly1305,
+            operation_type: EncryptType::Encryption,
+            show_close_buttons: false,
+            file_metada: String::new(),
+            open_tabs,
+            expanded_tab,
         };
-        title_bar_ui(ui, title_bar_rect, title);
+        let mut open_tabs = HashSet::new();
 
-        // Add the contents:
-        let content_rect = {
-            let mut rect = app_rect;
-            rect.min.y = title_bar_rect.max.y;
-            rect
+        for node in dock_state[SurfaceIndex::main()].iter() {
+            if let Some(tabs) = node.tabs() {
+                for tab in tabs {
+                    open_tabs.insert(tab.clone());
+                }
+            }
         }
-        .shrink(4.0);
-        let mut content_ui = ui.child_ui(content_rect, *ui.layout(), None);
-        add_contents(&mut content_ui);
-
-        themes::catppuccin::set_theme(&ctx, themes::catppuccin::LATTE);
-    });
+        Self {
+            context,
+            tree: dock_state,
+        }
+    }
 }
 
-fn title_bar_ui(ui: &mut egui::Ui, title_bar_rect: eframe::epaint::Rect, title: &str) {
-    use egui::*;
-
-    let painter = ui.painter();
-
-    let title_bar_response = ui.interact(
-        title_bar_rect,
-        Id::new("title_bar"),
-        Sense::click_and_drag(),
-    );
-
-    // Paint the title:
-    painter.text(
-        title_bar_rect.center(),
-        Align2::CENTER_CENTER,
-        title,
-        FontId::proportional(20.0),
-        ui.style().visuals.text_color(),
-    );
-
-    // Paint the line under the title:
-    painter.line_segment(
-        [
-            title_bar_rect.left_bottom() + vec2(1.0, 0.0),
-            title_bar_rect.right_bottom() + vec2(-1.0, 0.0),
-        ],
-        ui.visuals().widgets.noninteractive.bg_stroke,
-    );
-
-    // Interact with the title bar (drag to move window):
-    if title_bar_response.double_clicked() {
-        let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-        ui.ctx()
-            .send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
-    }
-
-    if title_bar_response.drag_started_by(PointerButton::Primary) {
-        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-    }
-
-    ui.allocate_ui_at_rect(title_bar_rect, |ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.visuals_mut().button_frame = false;
-            ui.add_space(8.0);
-            close_maximize_minimize(ui);
+impl eframe::App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        TopBottomPanel::top("egui_dock::MenuBar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("Algoritma", |ui| {
+                    for tab in &["ChaCha20-Poly1305", "Des"] {
+                        let is_open = self.context.open_tabs.contains(*tab);
+                        if ui.selectable_label(is_open, *tab).clicked() {
+                            if let Some(index) = self.tree.find_tab(&tab.to_string()) {
+                                if is_open && self.context.expanded_tab == Some(tab.to_string()) {
+                                    self.context.expanded_tab = None; // Collapse if already expanded
+                                } else {
+                                    self.context.expanded_tab = Some(tab.to_string()); // Expand selected tab
+                                    self.tree.remove_tab(index); // Remove from dock before re-adding
+                                }
+                                self.context.open_tabs.remove(*tab);
+                            } else {
+                                self.tree[SurfaceIndex::main()]
+                                    .push_to_focused_leaf(tab.to_string());
+                                self.context.expanded_tab = None; // Reset expanded state
+                            }
+                        }
+                    }
+                });
+                ui.menu_button("Tentang", |ui| {
+                    for tab in &["Author", "License"] {
+                        if ui
+                            .selectable_label(self.context.open_tabs.contains(*tab), *tab)
+                            .clicked()
+                        {
+                            println!("todo");
+                        }
+                    }
+                });
+            })
         });
-    });
-}
+        CentralPanel::default()
+            .frame(Frame::central_panel(&ctx.style()).inner_margin(0.))
+            .show(ctx, |ui| {
+                DockArea::new(&mut self.tree)
+                    .show_close_buttons(self.context.show_close_buttons)
+                    .show_inside(ui, &mut self.context);
+            });
 
-fn close_maximize_minimize(ui: &mut egui::Ui) {
-    use egui::{Button, RichText};
-
-    let button_height = 12.0;
-
-    let close_response = ui
-        .add(Button::new(RichText::new("❌").size(button_height)))
-        .on_hover_text("Close the window");
-    if close_response.clicked() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-    if is_maximized {
-        let maximized_response = ui
-            .add(Button::new(RichText::new("🗗").size(button_height)))
-            .on_hover_text("Restore window");
-        if maximized_response.clicked() {
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::Maximized(false));
+        if let Some(rx) = &self.context.rx {
+            if let Ok(message) = rx.try_recv() {
+                self.context.update_cipher_text(&message[0]);
+                self.context.update_output_message(&message[1]);
+                self.context.is_processing = false;
+            }
         }
-    } else {
-        let maximized_response = ui
-            .add(Button::new(RichText::new("🗗").size(button_height)))
-            .on_hover_text("Maximize window");
-        if maximized_response.clicked() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(true));
-        }
-    }
 
-    let minimized_response = ui
-        .add(Button::new(RichText::new("🗕").size(button_height)))
-        .on_hover_text("Minimize the window");
-    if minimized_response.clicked() {
-        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+        if self.context.is_processing {
+            ctx.request_repaint(); // Ensure UI is updated during processing
+        }
+        ctx.set_pixels_per_point(1.8);
+        themes::catppuccin::set_theme(&ctx, themes::catppuccin::FRAPPE);
     }
 }
-
